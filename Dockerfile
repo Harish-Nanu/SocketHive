@@ -14,9 +14,10 @@ RUN pip install --no-cache-dir . \
 USER hive
 EXPOSE 9000
 
-# The CLI client connects to SOCKETHIVE_HOST, which is 0.0.0.0 here; use loopback instead.
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["sockethive", "--log-level", "ERROR", "client", "--host", "127.0.0.1", "--retries", "0", "--timeout", "2", "ping"]
+# Pings over loopback using the server's own SOCKETHIVE_* settings, so it keeps
+# working when TLS or token auth is enabled.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["sockethive", "--log-level", "ERROR", "healthcheck"]
 
 ENTRYPOINT ["sockethive"]
 CMD ["server"]
