@@ -43,6 +43,10 @@ class ServerClosedConnection(RemoteError):
     """The server sent an error frame and is closing the connection."""
 
 
+class AuthenticationError(RemoteError):
+    """The server rejected (or requires) an auth token. Never retried."""
+
+
 class RequestTimeout(TimeoutError):
     """No response arrived within the client's timeout."""
 
@@ -62,6 +66,7 @@ class SocketHiveClient:
         max_frame_size: int = MAX_FRAME_SIZE,
         ssl_context: ssl.SSLContext | None = None,
         server_hostname: str | None = None,
+        auth_token: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -75,6 +80,7 @@ class SocketHiveClient:
         self.ssl_context = ssl_context
         # Name the server certificate must match; defaults to ``host``.
         self.server_hostname = server_hostname or host
+        self._auth_token = auth_token
 
         self.client_id: int | None = None
         self.server_info: dict[str, Any] = {}
@@ -138,6 +144,8 @@ class SocketHiveClient:
                 raise _closed_error(welcome)
             if welcome.get("type") != "welcome":
                 raise ProtocolError(f"expected welcome frame, got {welcome.get('type')!r}")
+            if welcome.get("auth_required"):
+                self._authenticate(sock)
         except BaseException:
             sock.close()
             raise
@@ -146,6 +154,19 @@ class SocketHiveClient:
         self.server_info = welcome
         self._last_activity = time.monotonic()
         log.debug("connected to %s:%d as client #%s", self.host, self.port, self.client_id)
+
+    def _authenticate(self, sock: socket.socket) -> None:
+        if self._auth_token is None:
+            raise AuthenticationError(ErrorCode.AUTH_FAILED, "server requires an auth token")
+        send_message(sock, {"type": "auth", "token": self._auth_token}, self.max_frame_size)
+        reply = recv_message(sock, self.max_frame_size)
+        if reply.get("type") == "error":
+            error = reply.get("error") or {}
+            raise AuthenticationError(
+                error.get("code", ErrorCode.AUTH_FAILED), error.get("message", "")
+            )
+        if reply.get("type") != "auth_ok":
+            raise ProtocolError(f"expected auth_ok, got {reply.get('type')!r}")
 
     def close(self) -> None:
         self.stop_heartbeat()

@@ -240,6 +240,18 @@ class AsyncSocketHiveServer:
         loop = asyncio.get_running_loop()
         ctx = self.core.context(client_id, addr)
         await self._write(writer, self.core.welcome(client_id))
+        if self.core.auth_required:
+            try:
+                frame = await asyncio.wait_for(
+                    read_message(reader, cfg.max_frame_size), cfg.handshake_timeout
+                )
+            except (asyncio.TimeoutError, ConnectionClosed, ProtocolError):
+                frame = {}
+            reply = self.core.authenticate(frame, ctx)
+            with contextlib.suppress(OSError):
+                await self._write(writer, reply)
+            if reply["type"] != "auth_ok":
+                return
         while True:
             try:
                 request = await self._next_request(reader)

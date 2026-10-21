@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 ENV_PREFIX = "SOCKETHIVE_"
 SERVER_MODES = ("threaded", "async")
@@ -32,6 +32,8 @@ class ServerConfig:
     tls_key: str = ""
     # Seconds a new client has to finish the TLS handshake (and authenticate).
     handshake_timeout: float = 10.0
+    # When set, clients must present this token before sending requests.
+    auth_token: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         if self.mode not in SERVER_MODES:

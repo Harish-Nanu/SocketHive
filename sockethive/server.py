@@ -37,7 +37,7 @@ from . import __version__
 from .aio_server import AsyncSocketHiveServer
 from .config import ServerConfig
 from .core import ServerCore
-from .handlers import CommandRegistry
+from .handlers import ClientContext, CommandRegistry
 from .protocol import (
     ConnectionClosed,
     ErrorCode,
@@ -245,8 +245,10 @@ class SocketHiveServer:
                 except (ssl.SSLError, OSError) as exc:
                     log.warning("client #%d TLS handshake failed: %s", client_id, exc)
                     return
-            conn.settimeout(cfg.idle_timeout)
             self._send(conn, self.core.welcome(client_id))
+            if self.core.auth_required and not self._authenticate(conn, ctx):
+                return
+            conn.settimeout(cfg.idle_timeout)
             while True:
                 try:
                     request = recv_message(conn, cfg.max_frame_size)
@@ -274,6 +276,16 @@ class SocketHiveServer:
         finally:
             self._release(conn, client_id)
             log.info("client #%d disconnected", client_id)
+
+    def _authenticate(self, conn: socket.socket, ctx: ClientContext) -> bool:
+        conn.settimeout(self.config.handshake_timeout)
+        try:
+            frame = recv_message(conn, self.config.max_frame_size)
+        except (TimeoutError, ConnectionClosed, ProtocolError):
+            frame = {}
+        reply = self.core.authenticate(frame, ctx)
+        _quietly(self._send, conn, reply)
+        return reply["type"] == "auth_ok"
 
     def _send(self, conn: socket.socket, message: dict[str, Any]) -> None:
         conn.sendall(self.core.encode(message))
