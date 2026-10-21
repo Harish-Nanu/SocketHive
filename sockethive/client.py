@@ -1,9 +1,10 @@
 """Thread-safe client with retries, automatic reconnection and heartbeats.
 
 Delivery semantics: if the connection drops while a request is in flight, the
-client reconnects and resends it once, so a request may run twice on the
-server (at-least-once). Timeouts are never retried, because the server may
-still be working on the request.
+client reconnects and resends it once with the same idempotency key. A server
+with deduplication enabled (the default) runs it only once and answers the
+retry with the original response. Timeouts are not retried automatically;
+call request() again with the same ``idempotency_key`` to retry one safely.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import socket
 import ssl
 import threading
 import time
+import uuid
 from typing import Any
 
 from .protocol import (
@@ -96,6 +98,8 @@ class SocketHiveClient:
         # Reentrant: request() may call connect() while holding it.
         self._lock = threading.RLock()
         self._ids = itertools.count(1)
+        # Prefix for idempotency keys: unique per client, stable across reconnects.
+        self.session_id = uuid.uuid4().hex
         self._last_activity = time.monotonic()
         self._heartbeat: threading.Thread | None = None
         self._heartbeat_stop = threading.Event()
@@ -195,7 +199,9 @@ class SocketHiveClient:
 
     # ------------------------------------------------------------------ requests
 
-    def request(self, command: str, payload: Any = None) -> Any:
+    def request(
+        self, command: str, payload: Any = None, *, idempotency_key: str | None = None
+    ) -> Any:
         """Send a command and return its result.
 
         Raises RemoteError if the server rejects the request, RequestTimeout if
@@ -203,11 +209,15 @@ class SocketHiveClient:
         unreachable.
         """
         with self._lock:
+            # The same id and key are reused if we resend after a dropped
+            # connection, so the server can recognise the retry.
+            request_id = next(self._ids)
+            key = idempotency_key or f"{self.session_id}:{request_id}"
             attempts = 2 if self.auto_reconnect else 1
             for attempt in range(attempts):
                 self.connect()
                 try:
-                    return self._roundtrip(command, payload)
+                    return self._roundtrip(request_id, key, command, payload)
                 except TimeoutError as exc:
                     # The stream may still deliver a late response; start fresh.
                     self._drop()
@@ -219,10 +229,10 @@ class SocketHiveClient:
                     log.warning("connection lost (%s); reconnecting", exc)
             raise AssertionError("unreachable")
 
-    def _roundtrip(self, command: str, payload: Any) -> Any:
+    def _roundtrip(self, request_id: int, key: str, command: str, payload: Any) -> Any:
         assert self._sock is not None
-        request_id = next(self._ids)
-        send_message(self._sock, make_request(request_id, command, payload), self.max_frame_size)
+        request = make_request(request_id, command, payload, key=key)
+        send_message(self._sock, request, self.max_frame_size)
         reply = recv_message(self._sock, self.max_frame_size)
         self._last_activity = time.monotonic()
 

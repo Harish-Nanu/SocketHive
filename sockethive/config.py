@@ -38,6 +38,11 @@ class ServerConfig:
     # up to rate_burst requests.
     rate_limit: float = 0.0
     rate_burst: int = 20
+    # Seconds the server remembers a request's idempotency key and response,
+    # so a retried request is answered from memory instead of running twice
+    # (0 disables), and the most keys it keeps at once.
+    dedup_ttl: float = 300.0
+    dedup_max_entries: int = 10_000
 
     def __post_init__(self) -> None:
         if self.mode not in SERVER_MODES:
@@ -58,6 +63,8 @@ class ServerConfig:
             raise ValueError("handshake_timeout must be > 0")
         if self.rate_limit < 0 or self.rate_burst < 1:
             raise ValueError("rate_limit must be >= 0 and rate_burst >= 1")
+        if self.dedup_ttl < 0 or self.dedup_max_entries < 1:
+            raise ValueError("dedup_ttl must be >= 0 and dedup_max_entries >= 1")
 
     @property
     def tls_enabled(self) -> bool:

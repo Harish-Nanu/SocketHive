@@ -12,10 +12,14 @@ Message shapes::
     {"type": "welcome",  "client_id": 7, "server": "SocketHive", "version": "0.1.0"}
     {"type": "auth",     "token": "..."}          (only when welcome has auth_required)
     {"type": "auth_ok"}
-    {"type": "request",  "id": 1, "command": "echo", "payload": "hi"}
+    {"type": "request",  "id": 1, "command": "echo", "payload": "hi", "key": "3f2a...:1"}
     {"type": "response", "id": 1, "ok": true,  "result": "hi"}
     {"type": "response", "id": 1, "ok": false, "error": {"code": "...", "message": "..."}}
     {"type": "error",    "error": {"code": "SERVER_BUSY", "message": "..."}}
+
+``key`` is optional. Requests sharing a key are executed at most once while
+the server remembers it; repeats get the original response with
+``"replayed": true``.
 
 ``error`` frames are not tied to a request; the server sends one right before
 closing a connection it cannot (or will no longer) serve.
@@ -126,8 +130,13 @@ def _recv_exactly(sock: socket.socket, n: int, *, at_boundary: bool) -> bytes:
     return bytes(buf)
 
 
-def make_request(request_id: int, command: str, payload: Any = None) -> dict[str, Any]:
-    return {"type": "request", "id": request_id, "command": command, "payload": payload}
+def make_request(
+    request_id: int, command: str, payload: Any = None, key: str | None = None
+) -> dict[str, Any]:
+    request = {"type": "request", "id": request_id, "command": command, "payload": payload}
+    if key is not None:
+        request["key"] = key
+    return request
 
 
 def make_response(request_id: Any, result: Any) -> dict[str, Any]:
