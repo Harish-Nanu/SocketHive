@@ -6,14 +6,21 @@ import os
 from dataclasses import dataclass, fields
 
 ENV_PREFIX = "SOCKETHIVE_"
+SERVER_MODES = ("threaded", "async")
 
 
 @dataclass(frozen=True)
 class ServerConfig:
+    # "threaded": one worker thread per connection.
+    # "async": one asyncio event loop for all connections, handlers in a thread pool.
+    mode: str = "threaded"
     host: str = "0.0.0.0"
     port: int = 9000
-    # Upper bound on simultaneously served clients; also the worker pool size.
+    # Upper bound on simultaneously served clients. In threaded mode this is
+    # also the worker pool size; async mode can afford much higher values.
     max_connections: int = 64
+    # Async mode only: threads available to run (possibly blocking) handlers.
+    handler_workers: int = 32
     # Seconds a client may stay silent before the server drops it.
     idle_timeout: float = 300.0
     max_frame_size: int = 1 << 20
@@ -22,10 +29,14 @@ class ServerConfig:
     shutdown_grace: float = 5.0
 
     def __post_init__(self) -> None:
+        if self.mode not in SERVER_MODES:
+            raise ValueError(f"mode must be one of {SERVER_MODES}, got {self.mode!r}")
         if not 0 <= self.port <= 65535:
             raise ValueError(f"port out of range: {self.port}")
         if self.max_connections < 1:
             raise ValueError("max_connections must be >= 1")
+        if self.handler_workers < 1:
+            raise ValueError("handler_workers must be >= 1")
         if self.idle_timeout <= 0:
             raise ValueError("idle_timeout must be > 0")
         if self.max_frame_size < 64:

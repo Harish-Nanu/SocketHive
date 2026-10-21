@@ -21,6 +21,7 @@ closing a connection it cannot (or will no longer) serve.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import struct
@@ -83,6 +84,28 @@ def recv_message(sock: socket.socket, max_size: int = MAX_FRAME_SIZE) -> dict[st
     if length > max_size:
         raise FrameTooLarge(f"peer announced {length} bytes, limit is {max_size}")
     return decode(_recv_exactly(sock, length, at_boundary=False))
+
+
+async def read_message(
+    reader: asyncio.StreamReader, max_size: int = MAX_FRAME_SIZE
+) -> dict[str, Any]:
+    """asyncio counterpart of recv_message(), with the same error semantics."""
+    try:
+        header = await reader.readexactly(HEADER.size)
+    except asyncio.IncompleteReadError as exc:
+        if not exc.partial:
+            raise ConnectionClosed("peer closed the connection") from None
+        raise ProtocolError("connection closed mid-frame") from None
+    (length,) = HEADER.unpack(header)
+    if length > max_size:
+        raise FrameTooLarge(f"peer announced {length} bytes, limit is {max_size}")
+    try:
+        body = await reader.readexactly(length)
+    except asyncio.IncompleteReadError as exc:
+        raise ProtocolError(
+            f"connection closed mid-frame ({len(exc.partial)}/{length} bytes)"
+        ) from None
+    return decode(body)
 
 
 def _recv_exactly(sock: socket.socket, n: int, *, at_boundary: bool) -> bytes:

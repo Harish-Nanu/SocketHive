@@ -33,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import __version__
+from .aio_server import AsyncSocketHiveServer
 from .config import ServerConfig
 from .core import ServerCore
 from .handlers import CommandRegistry
@@ -261,6 +262,16 @@ class SocketHiveServer:
             self._conn_closed.notify_all()
         self._slots.release()
         self.stats.connection_closed()
+
+
+def create_server(
+    config: ServerConfig | None = None, registry: CommandRegistry | None = None
+) -> SocketHiveServer | AsyncSocketHiveServer:
+    """Build the server implementation selected by ``config.mode``."""
+    config = config or ServerConfig()
+    if config.mode == "async":
+        return AsyncSocketHiveServer(config, registry)
+    return SocketHiveServer(config, registry)
 
 
 def _quietly(func: Any, *args: Any) -> None:
