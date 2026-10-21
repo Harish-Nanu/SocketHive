@@ -34,6 +34,10 @@ class ServerConfig:
     handshake_timeout: float = 10.0
     # When set, clients must present this token before sending requests.
     auth_token: str = field(default="", repr=False)
+    # Requests per second allowed per client IP (0 disables), with bursts of
+    # up to rate_burst requests.
+    rate_limit: float = 0.0
+    rate_burst: int = 20
 
     def __post_init__(self) -> None:
         if self.mode not in SERVER_MODES:
@@ -52,6 +56,8 @@ class ServerConfig:
             raise ValueError("tls_cert and tls_key must be given together")
         if self.handshake_timeout <= 0:
             raise ValueError("handshake_timeout must be > 0")
+        if self.rate_limit < 0 or self.rate_burst < 1:
+            raise ValueError("rate_limit must be >= 0 and rate_burst >= 1")
 
     @property
     def tls_enabled(self) -> bool:

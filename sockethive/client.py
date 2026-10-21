@@ -33,10 +33,17 @@ log = logging.getLogger(__name__)
 class RemoteError(Exception):
     """The server answered a request with an error response."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        self.details = details or {}
+
+    @property
+    def retry_after(self) -> float | None:
+        """Seconds the server asked us to wait (set on RATE_LIMITED errors)."""
+        value = self.details.get("retry_after")
+        return float(value) if isinstance(value, (int, float)) else None
 
 
 class ServerClosedConnection(RemoteError):
@@ -225,8 +232,10 @@ class SocketHiveClient:
             raise ProtocolError(f"unexpected reply to request {request_id}: {reply!r}")
         if reply.get("ok"):
             return reply.get("result")
-        error = reply.get("error") or {}
-        raise RemoteError(error.get("code", ErrorCode.INTERNAL), error.get("message", ""))
+        error = dict(reply.get("error") or {})
+        raise RemoteError(
+            error.pop("code", ErrorCode.INTERNAL), error.pop("message", ""), details=error
+        )
 
     def ping(self) -> float:
         """Round-trip a ping and return the latency in seconds."""

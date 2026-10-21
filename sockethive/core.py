@@ -22,7 +22,7 @@ from .protocol import (
     make_error_response,
     make_response,
 )
-from .security import token_matches
+from .security import RateLimiter, token_matches
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +39,7 @@ class ServerStats:
         self.requests_total = 0
         self.requests_failed = 0
         self.auth_failures = 0
+        self.requests_rate_limited = 0
 
     def connection_opened(self) -> None:
         with self._lock:
@@ -59,6 +60,10 @@ class ServerStats:
             if not ok:
                 self.requests_failed += 1
 
+    def rate_limited(self) -> None:
+        with self._lock:
+            self.requests_rate_limited += 1
+
     def auth_failed(self) -> None:
         with self._lock:
             self.auth_failures += 1
@@ -72,6 +77,7 @@ class ServerStats:
                 "connections_rejected": self.connections_rejected,
                 "requests_total": self.requests_total,
                 "requests_failed": self.requests_failed,
+                "requests_rate_limited": self.requests_rate_limited,
                 "auth_failures": self.auth_failures,
             }
 
@@ -81,6 +87,9 @@ class ServerCore:
         self.config = config
         self.registry = registry or default_registry()
         self.stats = ServerStats()
+        self.limiter = (
+            RateLimiter(config.rate_limit, config.rate_burst) if config.rate_limit > 0 else None
+        )
 
     def context(self, client_id: int, address: tuple[str, int]) -> ClientContext:
         return ClientContext(client_id=client_id, address=address[:2], stats=self.stats.snapshot)
@@ -117,6 +126,17 @@ class ServerCore:
         Blocks for as long as the handler does; never raises.
         """
         request_id = request.get("id")
+        if self.limiter is not None:
+            wait = self.limiter.acquire(ctx.address[0])
+            if wait:
+                self.stats.rate_limited()
+                return self._fail(
+                    request_id,
+                    ErrorCode.RATE_LIMITED,
+                    "too many requests",
+                    retry_after=round(wait, 3),
+                )
+
         command = request.get("command")
         if request.get("type") != "request" or not isinstance(command, str):
             return self._fail(
@@ -148,6 +168,6 @@ class ServerCore:
                 make_error_response(message.get("id"), ErrorCode.INTERNAL, "unencodable response")
             )
 
-    def _fail(self, request_id: Any, code: str, message: str) -> dict[str, Any]:
+    def _fail(self, request_id: Any, code: str, message: str, **details: Any) -> dict[str, Any]:
         self.stats.request_done(ok=False)
-        return make_error_response(request_id, code, message)
+        return make_error_response(request_id, code, message, **details)
