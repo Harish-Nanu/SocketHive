@@ -27,6 +27,7 @@ from __future__ import annotations
 import itertools
 import logging
 import socket
+import ssl
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +46,7 @@ from .protocol import (
     make_error,
     recv_message,
 )
+from .security import server_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +61,11 @@ class SocketHiveServer:
         self.core = ServerCore(self.config, registry)
         self.registry = self.core.registry
         self.stats = self.core.stats
+        self._ssl = (
+            server_ssl_context(self.config.tls_cert, self.config.tls_key)
+            if self.config.tls_enabled
+            else None
+        )
 
         self._listener: socket.socket | None = None
         self._address: tuple[str, int] | None = None
@@ -99,10 +106,11 @@ class SocketHiveServer:
         self._acceptor.start()
         host, port = self.address
         log.info(
-            "SocketHive %s listening on %s:%d (max_connections=%d, idle_timeout=%ss)",
+            "SocketHive %s listening on %s:%d%s (max_connections=%d, idle_timeout=%ss)",
             __version__,
             host,
             port,
+            " with TLS" if self._ssl else "",
             cfg.max_connections,
             cfg.idle_timeout,
         )
@@ -139,7 +147,7 @@ class SocketHiveServer:
             # while a worker mid-request can still write its response.
             with self._lock:
                 for conn in self._connections.values():
-                    _quietly(conn.shutdown, socket.SHUT_RD)
+                    _quietly(_shutdown_fd, conn, socket.SHUT_RD)
 
                 deadline = time.monotonic() + grace
                 while self._connections:
@@ -151,7 +159,7 @@ class SocketHiveServer:
                 if self._connections:
                     log.warning("force-closing %d connection(s)", len(self._connections))
                     for conn in self._connections.values():
-                        _quietly(conn.shutdown, socket.SHUT_RDWR)
+                        _quietly(_shutdown_fd, conn, socket.SHUT_RDWR)
 
             assert self._executor is not None
             self._executor.shutdown(wait=False, cancel_futures=True)
@@ -199,6 +207,9 @@ class SocketHiveServer:
                 self._slots.release()
                 self._send_and_close(conn, make_error(ErrorCode.SHUTTING_DOWN, "server stopping"))
                 return
+            if self._ssl is not None:
+                # No I/O yet: the handshake runs on the worker, not the acceptor.
+                conn = self._ssl.wrap_socket(conn, server_side=True, do_handshake_on_connect=False)
             client_id = next(self._ids)
             self._connections[client_id] = conn
         self.stats.connection_opened()
@@ -210,6 +221,11 @@ class SocketHiveServer:
             self._release(conn, client_id)
 
     def _send_and_close(self, conn: socket.socket, message: dict[str, Any]) -> None:
+        if self._ssl is not None:
+            # Saying why would need a TLS handshake on the acceptor thread; the
+            # client sees a dropped connection and retries with backoff instead.
+            conn.close()
+            return
         conn.settimeout(1.0)
         _quietly(conn.sendall, encode(message))
         conn.close()
@@ -222,6 +238,13 @@ class SocketHiveServer:
         ctx = self.core.context(client_id, addr)
         log.info("client #%d connected from %s", client_id, peer)
         try:
+            if isinstance(conn, ssl.SSLSocket):
+                conn.settimeout(cfg.handshake_timeout)
+                try:
+                    conn.do_handshake()
+                except (ssl.SSLError, OSError) as exc:
+                    log.warning("client #%d TLS handshake failed: %s", client_id, exc)
+                    return
             conn.settimeout(cfg.idle_timeout)
             self._send(conn, self.core.welcome(client_id))
             while True:
@@ -272,6 +295,16 @@ def create_server(
     if config.mode == "async":
         return AsyncSocketHiveServer(config, registry)
     return SocketHiveServer(config, registry)
+
+
+def _shutdown_fd(conn: socket.socket, how: int) -> None:
+    """shutdown() on the OS socket.
+
+    SSLSocket.shutdown() also discards the TLS layer, after which a response
+    sent during the graceful drain would go out unencrypted; calling the base
+    implementation only affects the file descriptor.
+    """
+    socket.socket.shutdown(conn, how)
 
 
 def _quietly(func: Any, *args: Any) -> None:

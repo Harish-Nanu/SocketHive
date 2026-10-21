@@ -12,6 +12,7 @@ import itertools
 import logging
 import random
 import socket
+import ssl
 import threading
 import time
 from typing import Any
@@ -59,6 +60,8 @@ class SocketHiveClient:
         max_backoff: float = 5.0,
         auto_reconnect: bool = True,
         max_frame_size: int = MAX_FRAME_SIZE,
+        ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -69,6 +72,9 @@ class SocketHiveClient:
         self.max_backoff = max_backoff
         self.auto_reconnect = auto_reconnect
         self.max_frame_size = max_frame_size
+        self.ssl_context = ssl_context
+        # Name the server certificate must match; defaults to ``host``.
+        self.server_hostname = server_hostname or host
 
         self.client_id: int | None = None
         self.server_info: dict[str, Any] = {}
@@ -97,6 +103,8 @@ class SocketHiveClient:
                 try:
                     self._open()
                     return self
+                except ssl.SSLCertVerificationError:
+                    raise  # an untrusted server will not become trusted by retrying
                 except (OSError, ConnectionClosed, ProtocolError, ServerClosedConnection) as exc:
                     last_exc = exc
                     if attempt == self.retries:
@@ -122,6 +130,8 @@ class SocketHiveClient:
         sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if self.ssl_context is not None:
+                sock = self.ssl_context.wrap_socket(sock, server_hostname=self.server_hostname)
             sock.settimeout(self.timeout)
             welcome = recv_message(sock, self.max_frame_size)
             if welcome.get("type") == "error":

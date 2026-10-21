@@ -31,6 +31,7 @@ from .config import ServerConfig
 from .core import ServerCore
 from .handlers import CommandRegistry
 from .protocol import ConnectionClosed, ErrorCode, ProtocolError, make_error, read_message
+from .security import server_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,11 @@ class AsyncSocketHiveServer:
         self.core = ServerCore(self.config, registry)
         self.registry = self.core.registry
         self.stats = self.core.stats
+        self._ssl = (
+            server_ssl_context(self.config.tls_cert, self.config.tls_key)
+            if self.config.tls_enabled
+            else None
+        )
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -106,11 +112,12 @@ class AsyncSocketHiveServer:
         cfg = self.config
         host, port = self.address
         log.info(
-            "SocketHive %s (async) listening on %s:%d "
+            "SocketHive %s (async) listening on %s:%d%s "
             "(max_connections=%d, handler_workers=%d, idle_timeout=%ss)",
             __version__,
             host,
             port,
+            " with TLS" if self._ssl else "",
             cfg.max_connections,
             cfg.handler_workers,
             cfg.idle_timeout,
@@ -121,7 +128,12 @@ class AsyncSocketHiveServer:
         cfg = self.config
         self._stop_signal = asyncio.get_running_loop().create_future()
         self._server = await asyncio.start_server(
-            self._handle_client, cfg.host, cfg.port, backlog=cfg.backlog
+            self._handle_client,
+            cfg.host,
+            cfg.port,
+            backlog=cfg.backlog,
+            ssl=self._ssl,
+            ssl_handshake_timeout=cfg.handshake_timeout if self._ssl else None,
         )
         self._address = self._server.sockets[0].getsockname()[:2]
 
@@ -165,6 +177,12 @@ class AsyncSocketHiveServer:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
 
+        # Python 3.13+: also drop connections still in their TLS handshake,
+        # which have no handler task yet.
+        abort_clients = getattr(self._server, "abort_clients", None)
+        if abort_clients is not None:
+            abort_clients()
+
     def __enter__(self) -> AsyncSocketHiveServer:
         return self.start()
 
@@ -207,7 +225,7 @@ class AsyncSocketHiveServer:
             log.exception("client #%d: unexpected error", client_id)
         finally:
             self._tasks.discard(task)
-            writer.close()
+            await _close(writer)
             self.stats.connection_closed()
             log.info("client #%d disconnected", client_id)
 
@@ -276,4 +294,16 @@ class AsyncSocketHiveServer:
         writer.write(self.core.encode(make_error(code, message)))
         with contextlib.suppress(Exception):
             await asyncio.wait_for(writer.drain(), 1.0)
-        writer.close()
+        await _close(writer)
+
+
+async def _close(writer: asyncio.StreamWriter) -> None:
+    """Close a stream and wait for it, so TLS close_notify finishes before the
+    loop stops; abort if the peer does not cooperate."""
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), 1.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        writer.transport.abort()
+    except Exception:
+        pass

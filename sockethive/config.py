@@ -27,6 +27,11 @@ class ServerConfig:
     backlog: int = 128
     # Seconds to wait for in-flight requests to finish during shutdown.
     shutdown_grace: float = 5.0
+    # TLS is enabled when both a certificate and a private key are given.
+    tls_cert: str = ""
+    tls_key: str = ""
+    # Seconds a new client has to finish the TLS handshake (and authenticate).
+    handshake_timeout: float = 10.0
 
     def __post_init__(self) -> None:
         if self.mode not in SERVER_MODES:
@@ -41,6 +46,14 @@ class ServerConfig:
             raise ValueError("idle_timeout must be > 0")
         if self.max_frame_size < 64:
             raise ValueError("max_frame_size must be >= 64")
+        if bool(self.tls_cert) != bool(self.tls_key):
+            raise ValueError("tls_cert and tls_key must be given together")
+        if self.handshake_timeout <= 0:
+            raise ValueError("handshake_timeout must be > 0")
+
+    @property
+    def tls_enabled(self) -> bool:
+        return bool(self.tls_cert)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None, **overrides) -> ServerConfig:

@@ -57,3 +57,24 @@ def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def tls_files(tmp_path_factory):
+    """A throwaway self-signed certificate valid for localhost and 127.0.0.1."""
+    import shutil
+    import subprocess
+
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl CLI not available")
+    directory = tmp_path_factory.mktemp("tls")
+    cert, key = directory / "cert.pem", directory / "key.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+         "-nodes", "-days", "1", "-subj", "/CN=localhost",
+         "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+         "-keyout", str(key), "-out", str(cert)],
+        check=True,
+        capture_output=True,
+    )  # fmt: skip
+    return str(cert), str(key)
