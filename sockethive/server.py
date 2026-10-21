@@ -104,6 +104,7 @@ class SocketHiveServer:
         self.stats = ServerStats()
 
         self._listener: socket.socket | None = None
+        self._address: tuple[str, int] | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._acceptor: threading.Thread | None = None
         self._slots = threading.BoundedSemaphore(self.config.max_connections)
@@ -122,10 +123,9 @@ class SocketHiveServer:
 
     @property
     def address(self) -> tuple[str, int]:
-        if self._listener is None:
+        if self._address is None:
             raise RuntimeError("server not started")
-        host, port = self._listener.getsockname()[:2]
-        return host, port
+        return self._address
 
     def start(self) -> SocketHiveServer:
         """Bind, listen and start accepting in the background. Returns self."""
@@ -134,6 +134,7 @@ class SocketHiveServer:
         cfg = self.config
         self._listener = socket.create_server((cfg.host, cfg.port), backlog=cfg.backlog)
         self._listener.settimeout(ACCEPT_POLL_INTERVAL)
+        self._address = self._listener.getsockname()[:2]
         self._executor = ThreadPoolExecutor(
             max_workers=cfg.max_connections, thread_name_prefix="worker"
         )
@@ -170,6 +171,9 @@ class SocketHiveServer:
             log.info("shutting down (grace period %ss)", grace)
             self._stopping.set()
 
+            # Wakes a blocked accept() immediately on Linux; elsewhere the
+            # acceptor notices _stopping within ACCEPT_POLL_INTERVAL.
+            _quietly(self._listener.shutdown, socket.SHUT_RDWR)
             if self._acceptor is not None:
                 self._acceptor.join()
             self._listener.close()
