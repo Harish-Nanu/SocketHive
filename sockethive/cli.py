@@ -12,9 +12,9 @@ from typing import Any
 from . import __version__
 from .bench import run_bench
 from .client import RemoteError, SocketHiveClient
-from .config import ServerConfig
+from .config import SERVER_MODES, ServerConfig
 from .log import setup_logging
-from .server import SocketHiveServer
+from .server import create_server
 
 
 def parse_payload(text: str | None) -> Any:
@@ -35,12 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("SOCKETHIVE_LOG_LEVEL", "INFO"),
         help="DEBUG, INFO, WARNING or ERROR (env: SOCKETHIVE_LOG_LEVEL)",
     )
-    sub = parser.add_subparsers(dest="mode", required=True)
+    sub = parser.add_subparsers(dest="subcommand", required=True)
 
     srv = sub.add_parser("server", help="run the server (flags override SOCKETHIVE_* env vars)")
+    srv.add_argument("--mode", choices=SERVER_MODES, help="concurrency model (default: threaded)")
     srv.add_argument("--host")
     srv.add_argument("--port", type=int)
     srv.add_argument("--max-connections", type=int)
+    srv.add_argument("--handler-workers", type=int, help="async mode: handler thread pool size")
     srv.add_argument("--idle-timeout", type=float)
     srv.add_argument("--max-frame-size", type=int)
     srv.add_argument("--shutdown-grace", type=float)
@@ -67,14 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run_server(args: argparse.Namespace) -> int:
     config = ServerConfig.from_env(
+        mode=args.mode,
         host=args.host,
         port=args.port,
         max_connections=args.max_connections,
+        handler_workers=args.handler_workers,
         idle_timeout=args.idle_timeout,
         max_frame_size=args.max_frame_size,
         shutdown_grace=args.shutdown_grace,
     )
-    server = SocketHiveServer(config)
+    server = create_server(config)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: server.request_shutdown())
     server.serve_forever()
@@ -137,9 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.log_level)
     try:
-        if args.mode == "server":
+        if args.subcommand == "server":
             return run_server(args)
-        if args.mode == "client":
+        if args.subcommand == "client":
             return run_client(args)
         return run_bench_cmd(args)
     except ConnectionError as exc:

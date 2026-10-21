@@ -34,3 +34,11 @@ def test_bench(server, capsys):
     assert 0 < result.percentile(50) <= result.percentile(99)
     assert "throughput" in result.report()
     assert main(["bench", "--port", str(server.address[1]), "-c", "2", "-n", "5"]) == 0
+
+
+def test_server_flags_parse():
+    from sockethive.cli import build_parser
+
+    args = build_parser().parse_args(["server", "--mode", "async", "--handler-workers", "4"])
+    assert (args.subcommand, args.mode, args.handler_workers) == ("server", "async", 4)
+    assert build_parser().parse_args(["server"]).mode is None  # falls back to env/default

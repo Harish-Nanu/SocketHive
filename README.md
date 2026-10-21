@@ -6,13 +6,15 @@ faults per connection and shuts down gracefully. The client retries with
 backoff, reconnects on its own and can send heartbeats.
 
 **Tech stack:** Python 3.10+, TCP/IP sockets, multithreading
-(`threading` + `concurrent.futures`), Docker / Docker Compose, pytest,
-GitHub Actions.
+(`threading` + `concurrent.futures`), `asyncio`, Docker / Docker Compose,
+pytest, GitHub Actions.
 
 ## Features
 
-- **Concurrent connections.** An acceptor thread hands each client to a bounded
-  worker pool. Slow requests on one client never block the others.
+- **Two server modes, one behaviour.** In `threaded` mode an acceptor thread
+  hands each client to a bounded worker pool. In `async` mode one asyncio event
+  loop multiplexes every connection, which scales to thousands of idle
+  clients. Slow requests on one client never block the others in either mode.
 - **Backpressure.** A hard connection limit (`max_connections`). Clients over
   the limit get a `SERVER_BUSY` frame instead of piling up threads, and the
   client retries with exponential backoff and jitter.
@@ -52,12 +54,33 @@ GitHub Actions.
 | Module | Responsibility |
 |---|---|
 | `sockethive/protocol.py` | Frame encoding and decoding, message builders, error codes |
-| `sockethive/server.py` | Accept loop, worker pool, connection limit, fault handling, shutdown, stats |
+| `sockethive/core.py` | Logic shared by both servers: dispatch, welcome frame, stats |
+| `sockethive/server.py` | Threaded server: accept loop, worker pool, connection limit, shutdown; `create_server()` |
+| `sockethive/aio_server.py` | asyncio server with the same interface and behaviour |
 | `sockethive/client.py` | Connect with retries, request/response, reconnect, timeouts, heartbeat |
 | `sockethive/handlers.py` | Command registry and built-in commands |
 | `sockethive/config.py` | `ServerConfig`, loaded from `SOCKETHIVE_*` environment variables |
 | `sockethive/bench.py` | Concurrent load generator |
-| `sockethive/cli.py` | `sockethive server | client | bench` |
+| `sockethive/cli.py` | The `sockethive` command: `server`, `client` and `bench` |
+
+### Choosing a server mode
+
+| | `threaded` (default) | `async` |
+|---|---|---|
+| Connection handling | One worker thread per connection | One event loop for all connections |
+| Handlers | Run on the connection's thread | Run in a pool of `handler_workers` threads |
+| Good for | Moderate client counts, simple to reason about | Many concurrent, mostly idle clients |
+| `max_connections` | Also the thread count, so keep it moderate | Can be in the thousands |
+
+Measured with 2,000 idle clients connected (Linux, Python 3.12):
+
+| Mode | Server threads | Server memory (RSS) |
+|---|---|---|
+| `threaded` | 2,002 | 69 MB |
+| `async` | 2 | 40 MB |
+
+Both modes speak the same protocol and share `ServerCore`, and the test suite
+runs every server and client test against both.
 
 ## Quick start
 
@@ -66,7 +89,7 @@ GitHub Actions.
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
 
-# Terminal 1: run the server
+# Terminal 1: run the server (threaded, or --mode async)
 sockethive server --port 9000 --max-connections 64
 
 # Terminal 2: talk to it
@@ -146,9 +169,11 @@ Precedence: CLI flags override environment variables, which override the default
 
 | Env var | Flag | Default | Description |
 |---|---|---|---|
+| `SOCKETHIVE_MODE` | `--mode` | `threaded` | `threaded` or `async` |
 | `SOCKETHIVE_HOST` | `--host` | `0.0.0.0` | Bind address |
 | `SOCKETHIVE_PORT` | `--port` | `9000` | TCP port |
-| `SOCKETHIVE_MAX_CONNECTIONS` | `--max-connections` | `64` | Concurrent clients (and worker threads) |
+| `SOCKETHIVE_MAX_CONNECTIONS` | `--max-connections` | `64` | Concurrent clients (in threaded mode, also the worker thread count) |
+| `SOCKETHIVE_HANDLER_WORKERS` | `--handler-workers` | `32` | Async mode: threads that run handlers |
 | `SOCKETHIVE_IDLE_TIMEOUT` | `--idle-timeout` | `300` | Seconds before a silent client is dropped |
 | `SOCKETHIVE_MAX_FRAME_SIZE` | `--max-frame-size` | `1048576` | Maximum frame body size in bytes |
 | `SOCKETHIVE_BACKLOG` | – | `128` | `listen()` backlog |
@@ -165,7 +190,7 @@ the server may still be processing the request.
 ## Development
 
 ```bash
-pytest -q              # 51 tests: protocol, handlers, server, client, CLI
+pytest -q              # protocol, handlers, server, client, CLI; server tests run in both modes
 ruff check . && ruff format --check .
 ```
 
