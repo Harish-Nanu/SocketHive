@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("SOCKETHIVE_LOG_LEVEL", "INFO"),
         help="DEBUG, INFO, WARNING or ERROR (env: SOCKETHIVE_LOG_LEVEL)",
     )
-    sub = parser.add_subparsers(dest="mode", required=True)
+    sub = parser.add_subparsers(dest="subcommand", required=True)
 
     srv = sub.add_parser("server", help="run the server (flags override SOCKETHIVE_* env vars)")
     srv.add_argument("--mode", choices=SERVER_MODES, help="concurrency model (default: threaded)")
@@ -141,9 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.log_level)
     try:
-        if args.mode == "server":
+        if args.subcommand == "server":
             return run_server(args)
-        if args.mode == "client":
+        if args.subcommand == "client":
             return run_client(args)
         return run_bench_cmd(args)
     except ConnectionError as exc:
