@@ -42,3 +42,35 @@ def test_server_flags_parse():
     args = build_parser().parse_args(["server", "--mode", "async", "--handler-workers", "4"])
     assert (args.subcommand, args.mode, args.handler_workers) == ("server", "async", 4)
     assert build_parser().parse_args(["server"]).mode is None  # falls back to env/default
+
+
+def test_client_over_tls_with_token(make_server, tls_files, capsys):
+    cert, key = tls_files
+    server = make_server(tls_cert=cert, tls_key=key, auth_token="t0k")
+    port = str(server.address[1])
+    base = ["client", "--port", port, "--retries", "0", "--ca-file", cert]
+    assert main([*base, "--token", "t0k", "echo", "secure"]) == 0
+    assert capsys.readouterr().out.strip() == "secure"
+    assert main([*base, "--token", "bad", "ping"]) == 2
+    assert "AUTH_FAILED" in capsys.readouterr().err
+    assert main(["client", "--port", port, "--retries", "0", "--tls", "ping"]) == 2  # untrusted
+
+
+def test_bench_with_tls_and_token(make_server, tls_files, capsys):
+    cert, key = tls_files
+    server = make_server(tls_cert=cert, tls_key=key, auth_token="t0k")
+    argv = ["bench", "--port", str(server.address[1]), "--ca-file", cert, "--token", "t0k"]
+    assert main([*argv, "-c", "3", "-n", "5"]) == 0
+    assert "completed          15" in capsys.readouterr().out
+
+
+def test_healthcheck_uses_server_env(make_server, tls_files, monkeypatch):
+    cert, key = tls_files
+    server = make_server(tls_cert=cert, tls_key=key, auth_token="t0k")
+    monkeypatch.setenv("SOCKETHIVE_PORT", str(server.address[1]))
+    monkeypatch.setenv("SOCKETHIVE_TLS_CERT", cert)
+    monkeypatch.setenv("SOCKETHIVE_TLS_KEY", key)
+    monkeypatch.setenv("SOCKETHIVE_AUTH_TOKEN", "t0k")
+    assert main(["healthcheck"]) == 0
+    monkeypatch.setenv("SOCKETHIVE_AUTH_TOKEN", "wrong")
+    assert main(["healthcheck"]) == 2
