@@ -98,9 +98,11 @@ from sockethive.server import SocketHiveServer
 
 registry = default_registry()
 
+
 @registry.register("square")
 def square(payload, ctx):
     return payload * payload
+
 
 with SocketHiveServer(ServerConfig(port=9000), registry):
     with SocketHiveClient("127.0.0.1", 9000) as client:
