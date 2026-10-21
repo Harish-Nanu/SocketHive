@@ -58,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     srv.add_argument("--rate-limit", type=float, help="requests/second per client IP (0 = off)")
     srv.add_argument("--rate-burst", type=int, help="burst size for --rate-limit")
+    srv.add_argument(
+        "--dedup-ttl", type=float, help="seconds to remember idempotency keys (0 = off)"
+    )
+    srv.add_argument("--dedup-max-entries", type=int, help="most idempotency keys kept")
 
     def add_target(p: argparse.ArgumentParser) -> None:
         p.add_argument("--host", default=os.environ.get("SOCKETHIVE_HOST", "127.0.0.1"))
@@ -119,6 +123,8 @@ def run_server(args: argparse.Namespace) -> int:
         auth_token=args.auth_token,
         rate_limit=args.rate_limit,
         rate_burst=args.rate_burst,
+        dedup_ttl=args.dedup_ttl,
+        dedup_max_entries=args.dedup_max_entries,
     )
     server = create_server(config)
     for sig in (signal.SIGINT, signal.SIGTERM):
