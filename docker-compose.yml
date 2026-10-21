@@ -4,6 +4,7 @@ services:
     image: sockethive:latest
     command: ["server"]
     environment:
+      SOCKETHIVE_MODE: "threaded"   # or "async" for many concurrent clients
       SOCKETHIVE_MAX_CONNECTIONS: "128"
       SOCKETHIVE_IDLE_TIMEOUT: "120"
       SOCKETHIVE_SHUTDOWN_GRACE: "5"
