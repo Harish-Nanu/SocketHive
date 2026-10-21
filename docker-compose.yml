@@ -1,0 +1,37 @@
+services:
+  server:
+    build: .
+    image: sockethive:latest
+    command: ["server"]
+    environment:
+      SOCKETHIVE_MAX_CONNECTIONS: "128"
+      SOCKETHIVE_IDLE_TIMEOUT: "120"
+      SOCKETHIVE_SHUTDOWN_GRACE: "5"
+      SOCKETHIVE_LOG_LEVEL: "INFO"
+    ports:
+      - "9000:9000"
+    restart: unless-stopped
+    # Longer than SOCKETHIVE_SHUTDOWN_GRACE so in-flight requests can drain on SIGTERM.
+    stop_grace_period: 10s
+
+  # Load test: docker compose --profile bench run --rm bench
+  bench:
+    image: sockethive:latest
+    profiles: ["bench"]
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      SOCKETHIVE_LOG_LEVEL: "WARNING"
+    command: ["bench", "--host", "server", "--clients", "50", "--requests", "200"]
+
+  # Interactive shell: docker compose --profile tools run --rm client
+  client:
+    image: sockethive:latest
+    profiles: ["tools"]
+    depends_on:
+      server:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    command: ["client", "--host", "server"]
