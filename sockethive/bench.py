@@ -69,7 +69,9 @@ def run_bench(
     command: str = "echo",
     payload: Any = "hello",
     timeout: float = 10.0,
+    **client_options: Any,
 ) -> BenchResult:
+    """Run ``clients`` concurrent clients; ``client_options`` go to SocketHiveClient."""
     lock = threading.Lock()
     latencies: list[float] = []
     errors: dict[str, int] = {}
@@ -81,7 +83,7 @@ def run_bench(
             errors[name] = errors.get(name, 0) + 1
 
     def worker() -> None:
-        client = SocketHiveClient(host, port, timeout=timeout)
+        client = SocketHiveClient(host, port, timeout=timeout, **client_options)
         local: list[float] = []
         try:
             client.connect()

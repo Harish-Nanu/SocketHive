@@ -18,9 +18,11 @@ from .protocol import (
     ErrorCode,
     FrameTooLarge,
     encode,
+    make_error,
     make_error_response,
     make_response,
 )
+from .security import RateLimiter, token_matches
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +38,8 @@ class ServerStats:
         self.connections_rejected = 0
         self.requests_total = 0
         self.requests_failed = 0
+        self.auth_failures = 0
+        self.requests_rate_limited = 0
 
     def connection_opened(self) -> None:
         with self._lock:
@@ -56,6 +60,14 @@ class ServerStats:
             if not ok:
                 self.requests_failed += 1
 
+    def rate_limited(self) -> None:
+        with self._lock:
+            self.requests_rate_limited += 1
+
+    def auth_failed(self) -> None:
+        with self._lock:
+            self.auth_failures += 1
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -65,6 +77,8 @@ class ServerStats:
                 "connections_rejected": self.connections_rejected,
                 "requests_total": self.requests_total,
                 "requests_failed": self.requests_failed,
+                "requests_rate_limited": self.requests_rate_limited,
+                "auth_failures": self.auth_failures,
             }
 
 
@@ -73,9 +87,16 @@ class ServerCore:
         self.config = config
         self.registry = registry or default_registry()
         self.stats = ServerStats()
+        self.limiter = (
+            RateLimiter(config.rate_limit, config.rate_burst) if config.rate_limit > 0 else None
+        )
 
     def context(self, client_id: int, address: tuple[str, int]) -> ClientContext:
         return ClientContext(client_id=client_id, address=address[:2], stats=self.stats.snapshot)
+
+    @property
+    def auth_required(self) -> bool:
+        return bool(self.config.auth_token)
 
     def welcome(self, client_id: int) -> dict[str, Any]:
         return {
@@ -83,7 +104,21 @@ class ServerCore:
             "client_id": client_id,
             "server": "SocketHive",
             "version": __version__,
+            "auth_required": self.auth_required,
         }
+
+    def authenticate(self, frame: dict[str, Any], ctx: ClientContext) -> dict[str, Any]:
+        """Check a client's auth frame and return the reply to send.
+
+        Anything but ``{"type": "auth_ok"}`` means the connection must be closed.
+        """
+        if frame.get("type") == "auth" and token_matches(
+            self.config.auth_token, frame.get("token")
+        ):
+            return {"type": "auth_ok"}
+        self.stats.auth_failed()
+        log.warning("client #%d from %s failed authentication", ctx.client_id, ctx.address[0])
+        return make_error(ErrorCode.AUTH_FAILED, "authentication failed")
 
     def dispatch(self, request: dict[str, Any], ctx: ClientContext) -> dict[str, Any]:
         """Run one request through its handler and build the response.
@@ -91,6 +126,17 @@ class ServerCore:
         Blocks for as long as the handler does; never raises.
         """
         request_id = request.get("id")
+        if self.limiter is not None:
+            wait = self.limiter.acquire(ctx.address[0])
+            if wait:
+                self.stats.rate_limited()
+                return self._fail(
+                    request_id,
+                    ErrorCode.RATE_LIMITED,
+                    "too many requests",
+                    retry_after=round(wait, 3),
+                )
+
         command = request.get("command")
         if request.get("type") != "request" or not isinstance(command, str):
             return self._fail(
@@ -122,6 +168,6 @@ class ServerCore:
                 make_error_response(message.get("id"), ErrorCode.INTERNAL, "unencodable response")
             )
 
-    def _fail(self, request_id: Any, code: str, message: str) -> dict[str, Any]:
+    def _fail(self, request_id: Any, code: str, message: str, **details: Any) -> dict[str, Any]:
         self.stats.request_done(ok=False)
-        return make_error_response(request_id, code, message)
+        return make_error_response(request_id, code, message, **details)

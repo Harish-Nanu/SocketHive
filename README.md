@@ -33,6 +33,9 @@ pytest, GitHub Actions.
   returns live counters.
 - **Load testing.** The built-in `bench` mode reports throughput and
   p50/p95/p99 latency.
+- **Security.** Optional TLS encryption (TLS 1.2+), token authentication
+  during the handshake and per-IP request rate limiting. All three work in
+  both server modes.
 - **Containerised.** Non-root Docker image with a healthcheck, plus a Compose
   setup with bench and interactive-client profiles.
 
@@ -59,6 +62,7 @@ pytest, GitHub Actions.
 | `sockethive/aio_server.py` | asyncio server with the same interface and behaviour |
 | `sockethive/client.py` | Connect with retries, request/response, reconnect, timeouts, heartbeat |
 | `sockethive/handlers.py` | Command registry and built-in commands |
+| `sockethive/security.py` | TLS contexts, constant-time token check, per-IP token-bucket rate limiter |
 | `sockethive/config.py` | `ServerConfig`, loaded from `SOCKETHIVE_*` environment variables |
 | `sockethive/bench.py` | Concurrent load generator |
 | `sockethive/cli.py` | The `sockethive` command: `server`, `client` and `bench` |
@@ -139,7 +143,9 @@ Every frame is a **4-byte big-endian length** followed by that many bytes of
 **UTF-8 JSON** (an object). Frames larger than `max_frame_size` are rejected.
 
 ```text
-server → {"type": "welcome",  "client_id": 7, "server": "SocketHive", "version": "0.1.0"}
+server → {"type": "welcome",  "client_id": 7, "server": "SocketHive", "version": "0.1.0", "auth_required": true}
+client → {"type": "auth",     "token": "..."}            (only when auth_required)
+server → {"type": "auth_ok"}
 client → {"type": "request",  "id": 1, "command": "echo", "payload": "hi"}
 server → {"type": "response", "id": 1, "ok": true, "result": "hi"}
 server → {"type": "response", "id": 2, "ok": false, "error": {"code": "UNKNOWN_COMMAND", "message": "..."}}
@@ -156,6 +162,8 @@ server → {"type": "error", "error": {"code": "IDLE_TIMEOUT", "message": "..."}
 | `SERVER_BUSY` | Connection limit reached | closed (the client retries) |
 | `IDLE_TIMEOUT` | The client was silent too long | closed (the client reconnects) |
 | `SHUTTING_DOWN` | The server is stopping | closed |
+| `AUTH_FAILED` | Wrong or missing token, or no auth frame within `handshake_timeout` | closed (not retried) |
+| `RATE_LIMITED` | Client IP exceeded `rate_limit`; the error includes `retry_after` seconds | stays open |
 
 ### Built-in commands
 
@@ -178,7 +186,60 @@ Precedence: CLI flags override environment variables, which override the default
 | `SOCKETHIVE_MAX_FRAME_SIZE` | `--max-frame-size` | `1048576` | Maximum frame body size in bytes |
 | `SOCKETHIVE_BACKLOG` | – | `128` | `listen()` backlog |
 | `SOCKETHIVE_SHUTDOWN_GRACE` | `--shutdown-grace` | `5` | Seconds allowed for draining on shutdown |
+| `SOCKETHIVE_TLS_CERT` | `--tls-cert` | – | PEM certificate chain (TLS is on when cert and key are set) |
+| `SOCKETHIVE_TLS_KEY` | `--tls-key` | – | PEM private key |
+| `SOCKETHIVE_HANDSHAKE_TIMEOUT` | `--handshake-timeout` | `10` | Seconds a new client has to finish TLS and auth |
+| `SOCKETHIVE_AUTH_TOKEN` | `--auth-token` | – | Token clients must present (prefer the env var) |
+| `SOCKETHIVE_RATE_LIMIT` | `--rate-limit` | `0` | Requests/second per client IP; `0` disables |
+| `SOCKETHIVE_RATE_BURST` | `--rate-burst` | `20` | Burst size for the rate limit |
 | `SOCKETHIVE_LOG_LEVEL` | `--log-level` | `INFO` | Logging level |
+
+## Security
+
+```bash
+# Self-signed certificate for local testing (use a real CA in production)
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 \
+  -subj /CN=localhost -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -keyout key.pem -out cert.pem
+
+export SOCKETHIVE_AUTH_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+sockethive server --tls-cert cert.pem --tls-key key.pem --rate-limit 50 --rate-burst 100
+
+# Client: trust the certificate; the token is read from SOCKETHIVE_AUTH_TOKEN
+sockethive client --ca-file cert.pem ping
+```
+
+```python
+from sockethive.client import SocketHiveClient
+from sockethive.security import client_ssl_context
+
+client = SocketHiveClient(
+    "server.example.com",
+    9000,
+    ssl_context=client_ssl_context("ca.pem"),
+    auth_token=token,
+)
+```
+
+How it behaves:
+
+- **TLS.** The server requires TLS 1.2 or newer. The client checks both the
+  certificate and the hostname, and a failed check is never retried.
+  `--insecure` still encrypts but skips verification; only use it for local
+  testing. In threaded mode the handshake runs on the worker thread, so a slow
+  client can't stall the acceptor. A threaded TLS server closes clients it
+  can't take (limit reached or shutting down) without a `SERVER_BUSY` frame;
+  the client sees a dropped connection and retries with backoff.
+- **Token auth.** Tokens are compared in constant time and never logged, and
+  `ServerConfig`'s repr hides them. Every connection and reconnection
+  authenticates again. The `stats` command reports `auth_failures`. Only use
+  tokens over TLS, because plain TCP sends them in the clear.
+- **Rate limiting.** Each client IP gets a token bucket shared by all its
+  connections. Buckets are evicted least-recently-used once 10,000 IPs are
+  tracked, so a flood of addresses can't exhaust memory. Behind a proxy or
+  load balancer every request appears to come from the proxy's IP.
+- **Docker.** `sockethive healthcheck` uses the server's own `SOCKETHIVE_*`
+  settings, so the container healthcheck keeps working with TLS and auth on.
 
 ## Delivery semantics
 

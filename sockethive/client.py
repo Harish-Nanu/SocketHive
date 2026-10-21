@@ -12,6 +12,7 @@ import itertools
 import logging
 import random
 import socket
+import ssl
 import threading
 import time
 from typing import Any
@@ -32,14 +33,25 @@ log = logging.getLogger(__name__)
 class RemoteError(Exception):
     """The server answered a request with an error response."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
+        self.details = details or {}
+
+    @property
+    def retry_after(self) -> float | None:
+        """Seconds the server asked us to wait (set on RATE_LIMITED errors)."""
+        value = self.details.get("retry_after")
+        return float(value) if isinstance(value, (int, float)) else None
 
 
 class ServerClosedConnection(RemoteError):
     """The server sent an error frame and is closing the connection."""
+
+
+class AuthenticationError(RemoteError):
+    """The server rejected (or requires) an auth token. Never retried."""
 
 
 class RequestTimeout(TimeoutError):
@@ -59,6 +71,9 @@ class SocketHiveClient:
         max_backoff: float = 5.0,
         auto_reconnect: bool = True,
         max_frame_size: int = MAX_FRAME_SIZE,
+        ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
+        auth_token: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -69,6 +84,10 @@ class SocketHiveClient:
         self.max_backoff = max_backoff
         self.auto_reconnect = auto_reconnect
         self.max_frame_size = max_frame_size
+        self.ssl_context = ssl_context
+        # Name the server certificate must match; defaults to ``host``.
+        self.server_hostname = server_hostname or host
+        self._auth_token = auth_token
 
         self.client_id: int | None = None
         self.server_info: dict[str, Any] = {}
@@ -97,6 +116,8 @@ class SocketHiveClient:
                 try:
                     self._open()
                     return self
+                except ssl.SSLCertVerificationError:
+                    raise  # an untrusted server will not become trusted by retrying
                 except (OSError, ConnectionClosed, ProtocolError, ServerClosedConnection) as exc:
                     last_exc = exc
                     if attempt == self.retries:
@@ -122,12 +143,16 @@ class SocketHiveClient:
         sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            if self.ssl_context is not None:
+                sock = self.ssl_context.wrap_socket(sock, server_hostname=self.server_hostname)
             sock.settimeout(self.timeout)
             welcome = recv_message(sock, self.max_frame_size)
             if welcome.get("type") == "error":
                 raise _closed_error(welcome)
             if welcome.get("type") != "welcome":
                 raise ProtocolError(f"expected welcome frame, got {welcome.get('type')!r}")
+            if welcome.get("auth_required"):
+                self._authenticate(sock)
         except BaseException:
             sock.close()
             raise
@@ -136,6 +161,19 @@ class SocketHiveClient:
         self.server_info = welcome
         self._last_activity = time.monotonic()
         log.debug("connected to %s:%d as client #%s", self.host, self.port, self.client_id)
+
+    def _authenticate(self, sock: socket.socket) -> None:
+        if self._auth_token is None:
+            raise AuthenticationError(ErrorCode.AUTH_FAILED, "server requires an auth token")
+        send_message(sock, {"type": "auth", "token": self._auth_token}, self.max_frame_size)
+        reply = recv_message(sock, self.max_frame_size)
+        if reply.get("type") == "error":
+            error = reply.get("error") or {}
+            raise AuthenticationError(
+                error.get("code", ErrorCode.AUTH_FAILED), error.get("message", "")
+            )
+        if reply.get("type") != "auth_ok":
+            raise ProtocolError(f"expected auth_ok, got {reply.get('type')!r}")
 
     def close(self) -> None:
         self.stop_heartbeat()
@@ -194,8 +232,10 @@ class SocketHiveClient:
             raise ProtocolError(f"unexpected reply to request {request_id}: {reply!r}")
         if reply.get("ok"):
             return reply.get("result")
-        error = reply.get("error") or {}
-        raise RemoteError(error.get("code", ErrorCode.INTERNAL), error.get("message", ""))
+        error = dict(reply.get("error") or {})
+        raise RemoteError(
+            error.pop("code", ErrorCode.INTERNAL), error.pop("message", ""), details=error
+        )
 
     def ping(self) -> float:
         """Round-trip a ping and return the latency in seconds."""

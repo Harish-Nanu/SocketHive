@@ -9,6 +9,14 @@ services:
       SOCKETHIVE_IDLE_TIMEOUT: "120"
       SOCKETHIVE_SHUTDOWN_GRACE: "5"
       SOCKETHIVE_LOG_LEVEL: "INFO"
+      SOCKETHIVE_RATE_LIMIT: "0"          # requests/second per client IP; 0 = off
+      # Security (see README). Mount certificates and pass the token from your
+      # shell or an .env file rather than committing it:
+      # SOCKETHIVE_TLS_CERT: /certs/cert.pem
+      # SOCKETHIVE_TLS_KEY: /certs/key.pem
+      # SOCKETHIVE_AUTH_TOKEN: ${SOCKETHIVE_AUTH_TOKEN}
+    # volumes:
+    #   - ./certs:/certs:ro
     ports:
       - "9000:9000"
     restart: unless-stopped

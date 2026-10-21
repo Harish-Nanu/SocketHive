@@ -10,6 +10,8 @@ coalesces segments.
 Message shapes::
 
     {"type": "welcome",  "client_id": 7, "server": "SocketHive", "version": "0.1.0"}
+    {"type": "auth",     "token": "..."}          (only when welcome has auth_required)
+    {"type": "auth_ok"}
     {"type": "request",  "id": 1, "command": "echo", "payload": "hi"}
     {"type": "response", "id": 1, "ok": true,  "result": "hi"}
     {"type": "response", "id": 1, "ok": false, "error": {"code": "...", "message": "..."}}
@@ -52,6 +54,8 @@ class ErrorCode:
     SERVER_BUSY = "SERVER_BUSY"
     IDLE_TIMEOUT = "IDLE_TIMEOUT"
     SHUTTING_DOWN = "SHUTTING_DOWN"
+    AUTH_FAILED = "AUTH_FAILED"
+    RATE_LIMITED = "RATE_LIMITED"
 
 
 def encode(message: dict[str, Any], max_size: int = MAX_FRAME_SIZE) -> bytes:
@@ -130,12 +134,12 @@ def make_response(request_id: Any, result: Any) -> dict[str, Any]:
     return {"type": "response", "id": request_id, "ok": True, "result": result}
 
 
-def make_error_response(request_id: Any, code: str, message: str) -> dict[str, Any]:
+def make_error_response(request_id: Any, code: str, message: str, **details: Any) -> dict[str, Any]:
     return {
         "type": "response",
         "id": request_id,
         "ok": False,
-        "error": {"code": code, "message": message},
+        "error": {"code": code, "message": message, **details},
     }
 
 
