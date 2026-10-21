@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
 
 from . import __version__
 from .config import ServerConfig
+from .dedup import MAX_KEY_LENGTH, ResponseCache
 from .handlers import ClientContext, CommandRegistry, InvalidPayload, default_registry
 from .protocol import (
     ErrorCode,
@@ -25,6 +27,9 @@ from .protocol import (
 from .security import RateLimiter, token_matches
 
 log = logging.getLogger(__name__)
+
+# How long a duplicate waits for the original request to finish.
+DUPLICATE_WAIT_SECONDS = 30.0
 
 
 class ServerStats:
@@ -40,6 +45,7 @@ class ServerStats:
         self.requests_failed = 0
         self.auth_failures = 0
         self.requests_rate_limited = 0
+        self.requests_deduplicated = 0
 
     def connection_opened(self) -> None:
         with self._lock:
@@ -60,6 +66,10 @@ class ServerStats:
             if not ok:
                 self.requests_failed += 1
 
+    def deduplicated(self) -> None:
+        with self._lock:
+            self.requests_deduplicated += 1
+
     def rate_limited(self) -> None:
         with self._lock:
             self.requests_rate_limited += 1
@@ -78,6 +88,7 @@ class ServerStats:
                 "requests_total": self.requests_total,
                 "requests_failed": self.requests_failed,
                 "requests_rate_limited": self.requests_rate_limited,
+                "requests_deduplicated": self.requests_deduplicated,
                 "auth_failures": self.auth_failures,
             }
 
@@ -89,6 +100,11 @@ class ServerCore:
         self.stats = ServerStats()
         self.limiter = (
             RateLimiter(config.rate_limit, config.rate_burst) if config.rate_limit > 0 else None
+        )
+        self.dedup = (
+            ResponseCache(config.dedup_ttl, config.dedup_max_entries)
+            if config.dedup_ttl > 0
+            else None
         )
 
     def context(self, client_id: int, address: tuple[str, int]) -> ClientContext:
@@ -123,8 +139,46 @@ class ServerCore:
     def dispatch(self, request: dict[str, Any], ctx: ClientContext) -> dict[str, Any]:
         """Run one request through its handler and build the response.
 
-        Blocks for as long as the handler does; never raises.
+        A request carrying an idempotency ``key`` the server has seen recently
+        is not run again: it gets the stored response, waiting for it if the
+        original is still running. Blocks for as long as the handler does;
+        never raises.
         """
+        request_id = request.get("id")
+        key = request.get("key")
+        if key is None or self.dedup is None:
+            return self._execute(request, ctx)
+        if not isinstance(key, str) or not 0 < len(key) <= MAX_KEY_LENGTH:
+            return self._fail(
+                request_id,
+                ErrorCode.BAD_REQUEST,
+                f"key must be a non-empty string of at most {MAX_KEY_LENGTH} characters",
+            )
+
+        future, owner = self.dedup.claim(key)
+        if not owner:
+            self.stats.deduplicated()
+            try:
+                original = future.result(timeout=DUPLICATE_WAIT_SECONDS)
+            except FutureTimeout:
+                return self._fail(
+                    request_id, ErrorCode.INTERNAL, "original request is still running"
+                )
+            return {**original, "id": request_id, "replayed": True}
+
+        try:
+            response = self._execute(request, ctx)
+        except BaseException:
+            self.dedup.release(key, future, make_error_response(request_id, ErrorCode.INTERNAL, ""))
+            raise
+        if response.get("error", {}).get("code") == ErrorCode.RATE_LIMITED:
+            # Never ran, so don't remember it: the client's retry must run.
+            self.dedup.release(key, future, response)
+        else:
+            self.dedup.complete(future, response)
+        return response
+
+    def _execute(self, request: dict[str, Any], ctx: ClientContext) -> dict[str, Any]:
         request_id = request.get("id")
         if self.limiter is not None:
             wait = self.limiter.acquire(ctx.address[0])

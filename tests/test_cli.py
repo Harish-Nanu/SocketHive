@@ -42,6 +42,8 @@ def test_server_flags_parse():
     args = build_parser().parse_args(["server", "--mode", "async", "--handler-workers", "4"])
     assert (args.subcommand, args.mode, args.handler_workers) == ("server", "async", 4)
     assert build_parser().parse_args(["server"]).mode is None  # falls back to env/default
+    args = build_parser().parse_args(["server", "--dedup-ttl", "0", "--dedup-max-entries", "5"])
+    assert (args.dedup_ttl, args.dedup_max_entries) == (0.0, 5)
 
 
 def test_client_over_tls_with_token(make_server, tls_files, capsys):

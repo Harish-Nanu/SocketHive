@@ -33,6 +33,9 @@ pytest, GitHub Actions.
   returns live counters.
 - **Load testing.** The built-in `bench` mode reports throughput and
   p50/p95/p99 latency.
+- **No duplicate execution.** Every request carries an idempotency key. If a
+  connection drops mid-request and the client resends, the server answers from
+  memory (or waits for the original) instead of running the command twice.
 - **Security.** Optional TLS encryption (TLS 1.2+), token authentication
   during the handshake and per-IP request rate limiting. All three work in
   both server modes.
@@ -62,6 +65,7 @@ pytest, GitHub Actions.
 | `sockethive/aio_server.py` | asyncio server with the same interface and behaviour |
 | `sockethive/client.py` | Connect with retries, request/response, reconnect, timeouts, heartbeat |
 | `sockethive/handlers.py` | Command registry and built-in commands |
+| `sockethive/dedup.py` | Response cache that makes retried requests run once |
 | `sockethive/security.py` | TLS contexts, constant-time token check, per-IP token-bucket rate limiter |
 | `sockethive/config.py` | `ServerConfig`, loaded from `SOCKETHIVE_*` environment variables |
 | `sockethive/bench.py` | Concurrent load generator |
@@ -146,7 +150,7 @@ Every frame is a **4-byte big-endian length** followed by that many bytes of
 server → {"type": "welcome",  "client_id": 7, "server": "SocketHive", "version": "0.1.0", "auth_required": true}
 client → {"type": "auth",     "token": "..."}            (only when auth_required)
 server → {"type": "auth_ok"}
-client → {"type": "request",  "id": 1, "command": "echo", "payload": "hi"}
+client → {"type": "request",  "id": 1, "command": "echo", "payload": "hi", "key": "<session>:1"}
 server → {"type": "response", "id": 1, "ok": true, "result": "hi"}
 server → {"type": "response", "id": 2, "ok": false, "error": {"code": "UNKNOWN_COMMAND", "message": "..."}}
 server → {"type": "error", "error": {"code": "IDLE_TIMEOUT", "message": "..."}}   (then closes)
@@ -192,6 +196,8 @@ Precedence: CLI flags override environment variables, which override the default
 | `SOCKETHIVE_AUTH_TOKEN` | `--auth-token` | – | Token clients must present (prefer the env var) |
 | `SOCKETHIVE_RATE_LIMIT` | `--rate-limit` | `0` | Requests/second per client IP; `0` disables |
 | `SOCKETHIVE_RATE_BURST` | `--rate-burst` | `20` | Burst size for the rate limit |
+| `SOCKETHIVE_DEDUP_TTL` | `--dedup-ttl` | `300` | Seconds the server remembers idempotency keys; `0` disables |
+| `SOCKETHIVE_DEDUP_MAX_ENTRIES` | `--dedup-max-entries` | `10000` | Most keys remembered at once (oldest evicted first) |
 | `SOCKETHIVE_LOG_LEVEL` | `--log-level` | `INFO` | Logging level |
 
 ## Security
@@ -243,10 +249,28 @@ How it behaves:
 
 ## Delivery semantics
 
-If a connection drops while a request is in flight, the client reconnects and
-resends the request **once**. This is *at-least-once* delivery, so handlers
-with side effects should be idempotent. Timeouts are never retried, because
-the server may still be processing the request.
+Every request carries an idempotency key, `"<client session id>:<request id>"`.
+If the connection drops while a request is in flight, the client reconnects
+and resends the request **once with the same key**. The server remembers each
+key for `dedup_ttl` seconds:
+
+- **Original finished:** the retry gets the stored response, marked
+  `"replayed": true`, and the handler doesn't run again.
+- **Original still running:** the retry waits for it and gets the same result.
+- **Rejected by the rate limiter:** the request never ran, so the server
+  doesn't remember it and the retry runs normally.
+
+Within that window a request therefore runs **at most once**, however many
+times it's resent. Timeouts aren't retried automatically. To retry one safely,
+pass your own key and call again:
+
+```python
+client.request("charge", {"amount": 10}, idempotency_key="order-1234")
+```
+
+A key you choose yourself also covers retries from another client or process,
+for example after a crash. Keys are stored in memory, so they're lost when the
+server restarts and aren't shared between server instances.
 
 ## Development
 
