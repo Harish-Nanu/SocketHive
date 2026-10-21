@@ -17,10 +17,20 @@ from sockethive.protocol import (
 )
 
 
-def raw_connect(server):
-    sock = socket.create_connection(server.address, timeout=5)
-    assert recv_message(sock)["type"] == "welcome"
-    return sock
+@pytest.fixture
+def raw_connect():
+    """Open plain sockets that have completed the welcome handshake."""
+    socks = []
+
+    def connect(server):
+        sock = socket.create_connection(server.address, timeout=5)
+        socks.append(sock)
+        assert recv_message(sock)["type"] == "welcome"
+        return sock
+
+    yield connect
+    for sock in socks:
+        sock.close()
 
 
 def wait_for(predicate, timeout=5.0):
@@ -127,7 +137,7 @@ def test_connection_limit_rejects_with_server_busy(make_server, make_client):
     assert held[1].request("ping") == "pong"
 
 
-def test_idle_client_is_disconnected(make_server):
+def test_idle_client_is_disconnected(make_server, raw_connect):
     server = make_server(idle_timeout=0.3)
     sock = raw_connect(server)
     frame = recv_message(sock)
@@ -136,7 +146,7 @@ def test_idle_client_is_disconnected(make_server):
     assert wait_for(lambda: server.stats.snapshot()["connections_active"] == 0)
 
 
-def test_malformed_frame_drops_only_that_client(server, make_client):
+def test_malformed_frame_drops_only_that_client(server, make_client, raw_connect):
     healthy = make_client(server).connect()
 
     bad = raw_connect(server)
@@ -148,14 +158,14 @@ def test_malformed_frame_drops_only_that_client(server, make_client):
     assert healthy.request("ping") == "pong"
 
 
-def test_oversized_frame_rejected(make_server):
+def test_oversized_frame_rejected(make_server, raw_connect):
     server = make_server(max_frame_size=1024)
     sock = raw_connect(server)
     sock.sendall(HEADER.pack(10_000_000))
     assert recv_message(sock)["error"]["code"] == ErrorCode.BAD_FRAME
 
 
-def test_bad_request_shape(server):
+def test_bad_request_shape(server, raw_connect):
     sock = raw_connect(server)
     send_message(sock, {"type": "request", "id": 9, "command": 42})
     reply = recv_message(sock)
@@ -163,7 +173,7 @@ def test_bad_request_shape(server):
     assert reply["error"]["code"] == ErrorCode.BAD_REQUEST
 
 
-def test_abrupt_client_disconnect_is_cleaned_up(server):
+def test_abrupt_client_disconnect_is_cleaned_up(server, raw_connect):
     sock = raw_connect(server)
     # Send half a frame then reset the connection.
     sock.sendall(encode(make_request(1, "echo", "x"))[:5])
@@ -172,7 +182,7 @@ def test_abrupt_client_disconnect_is_cleaned_up(server):
     assert wait_for(lambda: server.stats.snapshot()["connections_active"] == 0)
 
 
-def test_graceful_shutdown_drains_in_flight_requests(make_server, make_client):
+def test_graceful_shutdown_drains_in_flight_requests(make_server, make_client, raw_connect):
     server = make_server()
     busy = make_client(server, auto_reconnect=False).connect()
     idle = raw_connect(server)

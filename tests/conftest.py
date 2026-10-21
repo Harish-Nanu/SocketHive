@@ -4,17 +4,26 @@ import pytest
 
 from sockethive.client import SocketHiveClient
 from sockethive.config import ServerConfig
-from sockethive.server import SocketHiveServer
+from sockethive.server import create_server
+
+
+@pytest.fixture(params=["threaded", "async"])
+def server_mode(request):
+    return request.param
 
 
 @pytest.fixture
-def make_server():
-    """Factory for servers on an ephemeral localhost port, stopped after the test."""
+def make_server(server_mode):
+    """Factory for servers on an ephemeral localhost port, stopped after the test.
+
+    Every test using it runs once per server implementation.
+    """
     servers = []
 
     def factory(registry=None, **overrides):
+        overrides.setdefault("mode", server_mode)
         config = ServerConfig(host="127.0.0.1", port=overrides.pop("port", 0), **overrides)
-        server = SocketHiveServer(config, registry).start()
+        server = create_server(config, registry).start()
         servers.append(server)
         return server
 
