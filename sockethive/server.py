@@ -34,16 +34,14 @@ from typing import Any
 
 from . import __version__
 from .config import ServerConfig
-from .handlers import ClientContext, CommandRegistry, InvalidPayload, default_registry
+from .core import ServerCore
+from .handlers import CommandRegistry
 from .protocol import (
     ConnectionClosed,
     ErrorCode,
-    FrameTooLarge,
     ProtocolError,
     encode,
     make_error,
-    make_error_response,
-    make_response,
     recv_message,
 )
 
@@ -52,56 +50,14 @@ log = logging.getLogger(__name__)
 ACCEPT_POLL_INTERVAL = 0.5
 
 
-class ServerStats:
-    """Thread-safe counters describing server activity."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._started = time.monotonic()
-        self.connections_total = 0
-        self.connections_active = 0
-        self.connections_rejected = 0
-        self.requests_total = 0
-        self.requests_failed = 0
-
-    def connection_opened(self) -> None:
-        with self._lock:
-            self.connections_total += 1
-            self.connections_active += 1
-
-    def connection_closed(self) -> None:
-        with self._lock:
-            self.connections_active -= 1
-
-    def connection_rejected(self) -> None:
-        with self._lock:
-            self.connections_rejected += 1
-
-    def request_done(self, ok: bool) -> None:
-        with self._lock:
-            self.requests_total += 1
-            if not ok:
-                self.requests_failed += 1
-
-    def snapshot(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "uptime_seconds": round(time.monotonic() - self._started, 3),
-                "connections_total": self.connections_total,
-                "connections_active": self.connections_active,
-                "connections_rejected": self.connections_rejected,
-                "requests_total": self.requests_total,
-                "requests_failed": self.requests_failed,
-            }
-
-
 class SocketHiveServer:
     def __init__(
         self, config: ServerConfig | None = None, registry: CommandRegistry | None = None
     ) -> None:
         self.config = config or ServerConfig()
-        self.registry = registry or default_registry()
-        self.stats = ServerStats()
+        self.core = ServerCore(self.config, registry)
+        self.registry = self.core.registry
+        self.stats = self.core.stats
 
         self._listener: socket.socket | None = None
         self._address: tuple[str, int] | None = None
@@ -262,16 +218,11 @@ class SocketHiveServer:
     def _serve_client(self, conn: socket.socket, addr: tuple[str, int], client_id: int) -> None:
         cfg = self.config
         peer = f"{addr[0]}:{addr[1]}"
-        ctx = ClientContext(client_id=client_id, address=addr[:2], stats=self.stats.snapshot)
+        ctx = self.core.context(client_id, addr)
         log.info("client #%d connected from %s", client_id, peer)
         try:
             conn.settimeout(cfg.idle_timeout)
-            self._send(conn, {
-                "type": "welcome",
-                "client_id": client_id,
-                "server": "SocketHive",
-                "version": __version__,
-            })  # fmt: skip
+            self._send(conn, self.core.welcome(client_id))
             while True:
                 try:
                     request = recv_message(conn, cfg.max_frame_size)
@@ -286,7 +237,7 @@ class SocketHiveServer:
                     self._send(conn, make_error(ErrorCode.BAD_FRAME, str(exc)))
                     break
 
-                self._send(conn, self._dispatch(request, ctx))
+                self._send(conn, self.core.dispatch(request, ctx))
                 if self._stopping.is_set():
                     break
 
@@ -300,42 +251,8 @@ class SocketHiveServer:
             self._release(conn, client_id)
             log.info("client #%d disconnected", client_id)
 
-    def _dispatch(self, request: dict[str, Any], ctx: ClientContext) -> dict[str, Any]:
-        request_id = request.get("id")
-        command = request.get("command")
-        if request.get("type") != "request" or not isinstance(command, str):
-            return self._fail(
-                request_id, ErrorCode.BAD_REQUEST, "expected a request with a command"
-            )
-
-        handler = self.registry.get(command)
-        if handler is None:
-            return self._fail(request_id, ErrorCode.UNKNOWN_COMMAND, f"unknown command: {command}")
-
-        try:
-            result = handler(request.get("payload"), ctx)
-        except InvalidPayload as exc:
-            return self._fail(request_id, ErrorCode.INVALID_PAYLOAD, str(exc))
-        except Exception:
-            log.exception("handler for %r failed (client #%d)", command, ctx.client_id)
-            return self._fail(request_id, ErrorCode.INTERNAL, f"command {command!r} failed")
-
-        self.stats.request_done(ok=True)
-        return make_response(request_id, result)
-
-    def _fail(self, request_id: Any, code: str, message: str) -> dict[str, Any]:
-        self.stats.request_done(ok=False)
-        return make_error_response(request_id, code, message)
-
     def _send(self, conn: socket.socket, message: dict[str, Any]) -> None:
-        try:
-            data = encode(message, self.config.max_frame_size)
-        except (TypeError, ValueError, FrameTooLarge) as exc:
-            log.error("cannot encode response: %s", exc)
-            data = encode(
-                make_error_response(message.get("id"), ErrorCode.INTERNAL, "unencodable response")
-            )
-        conn.sendall(data)
+        conn.sendall(self.core.encode(message))
 
     def _release(self, conn: socket.socket, client_id: int) -> None:
         conn.close()
